@@ -1,0 +1,18 @@
+# Конфигурационный файл графических утилит для Astra Linux 1.8+
+astra_kcm_devices_and_rules    - Управление устройствами и правилами
+astra_kcm_policy_clean_memory  - Политики очистки памяти
+astra_kcm_policy_complexity    - Настройка политики сложности паролей
+astra_kcm_policy_history       - Настройка политики истории паролей
+astra_kcm_policy_lockout       - Настройка политики блокировки учётных записей
+astra_kcm_policy_login         - Настройка политики локального входа
+astra_kcm_policy_user_creation - Настройка политики создания пользователей
+fly-admin-dm                   - Настройка входа в систему
+libastra_kcm_policy_expiration - Настройка политики срока действия паролей
+astra_kcm_groups               - Управление группами
+astra_kcm_users                - Управление пользователями
+astra_kcm_digsig               - Средство повышения безопасности ОС путем контроля целостности файлов
+astra_kcm_graphics_kiosk       - Настройка графического киоска
+astra_kcm_kernel_parameters    - KCM модуль безопасности для настроек ядра
+fly-admin-kiosk                - Приложение для управления ограничением среды
+astra_kcm_mac                  - Управление мандатным доступом
+astra_kcm_mic                  - Управление мандатный контролем целостности
