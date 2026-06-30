@@ -117,8 +117,8 @@ while true; do
                          --cancel-button "Назад" \
                          --menu "   ───┤ Управление: ↑/↓ - переход, Enter - выбор, Tab - кнопки ├───\n\nВыбран новый максимальный уровень: $target_level_id ($target_level_name)\n\nУровни будут настроены в диапазоне 0 - $target_level_id.\nВыберите режим именования:" \
                          18 76 2 \
-                         "Имена по ГОСТ ($gost_names)" "" \
-                         "Задать собственные названия (ручной ввод)" "" \
+                         "1" "Имена по ГОСТ ($gost_names)" \
+                         "2" "Задать собственные названия (ручной ввод)" \
                          3>&1 1>&2 2>&3)
     exit_code=$?
     if [ $exit_code -ne 0 ]; then
@@ -159,13 +159,9 @@ while true; do
             continue
         fi
     else
-        # Оставить стандартные / текущие имена - сбрасываем к исходным
+        # Имена по ГОСТ - сбрасываем к дефолтным ГОСТ-значениям
         for (( i=0; i<=target_level_id; i++ )); do
-            if [[ -n "${LVL_NAME[$i]}" ]]; then
-                CUSTOM_NAMES[$i]="${LVL_NAME[$i]}"
-            else
-                CUSTOM_NAMES[$i]="${DEFAULT_VALS[$i]}"
-            fi
+            CUSTOM_NAMES[$i]="${DEFAULT_VALS[$i]}"
         done
     fi
     
@@ -190,6 +186,7 @@ while true; do
     whiptail --title "Настройка MAC" --infobox "Применение настроек...\nОбновление $MAC_FILE и перезапуск службы PARSEC." 10 65
     
     TMP=$(mktemp)
+    echo "#levels" > "$TMP"
     for (( i=0; i<=target_level_id; i++ )); do
         printf "%s:%d\n" "${CUSTOM_NAMES[$i]}" "$i" >> "$TMP"
     done
@@ -205,7 +202,7 @@ while true; do
     fi
     sleep 1
     
-    whiptail --title "Успех" --msgbox "Новый набор уровней (0-$target_level_id) успешно применён в системе." 8 58
+    whiptail --title "Успех" --msgbox "Новый набор уровней (0-$target_level_id) успешно применён в системе.\n\nВНИМАНИЕ: Для корректного применения уровней в запущенных сессиях пользователей рекомендуется перезагрузить операционную систему." 10 65
     break # Выходим из цикла настройки, переходим к меню
 done
 

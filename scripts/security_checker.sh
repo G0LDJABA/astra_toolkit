@@ -960,6 +960,8 @@ execute_audit() {
         return 1
     fi
 
+    mkdir -p "$ROOT_DIR/report"
+
     JSON_DATA=""
     JSON_SCREENS=""
 
@@ -1229,6 +1231,10 @@ execute_audit() {
         generate_html
     } | whiptail --gauge "Выполнение аудита безопасности..." 10 70 0
 
+    if [ -n "$SUDO_UID" ] && [ -n "$SUDO_GID" ]; then
+        chown -R "$SUDO_UID:$SUDO_GID" "$ROOT_DIR/report" 2>/dev/null
+    fi
+
     whiptail --title "Аудит завершен" --msgbox "Аудит безопасности успешно завершен.\n\nОтчет сохранен в:\n$REPORT_FILE\n\nПодробный лог выполнения доступен в:\n/tmp/security_checker_raw.log" 14 76
 }
 
@@ -1246,6 +1252,406 @@ generate_html() {
             echo "============================================================"
         } >> /tmp/security_checker_raw.log 2>&1
     fi
+}
+
+# ------------------------------------------------------------
+#                  ФУНКЦИИ КОНТРОЛЯ СООТВЕТСТВИЯ РД АС
+# ------------------------------------------------------------
+get_pwquality_param() {
+    local key="$1"
+    local file="/etc/security/pwquality.conf"
+    [ ! -f "$file" ] && { echo "0"; return; }
+    local val
+    val=$(grep -E "^\s*${key}\s*=" "$file" | cut -d= -f2 | tr -d ' \t\r\n')
+    if [ -z "$val" ]; then
+        val=$(grep -E "^\s*#\s*${key}\s*=" "$file" | cut -d= -f2 | tr -d ' \t\r\n')
+    fi
+    echo "${val:-0}"
+}
+
+get_logindefs_param() {
+    local key="$1"
+    local file="/etc/login.defs"
+    [ ! -f "$file" ] && { echo "0"; return; }
+    local val
+    val=$(grep -E "^\s*${key}\s+" "$file" | awk '{print $2}' | tr -d '\r\n')
+    echo "${val:-0}"
+}
+
+get_faillock_param() {
+    local key="$1"
+    local file="/etc/security/faillock.conf"
+    [ ! -f "$file" ] && { echo "0"; return; }
+    local val
+    val=$(grep -E "^\s*${key}\s*=" "$file" | cut -d= -f2 | tr -d ' \t\r\n')
+    echo "${val:-0}"
+}
+
+get_password_history() {
+    local file="/etc/pam.d/common-password"
+    [ ! -f "$file" ] && { echo "0"; return; }
+    local val
+    val=$(grep -E "pam_unix.so" "$file" | grep -oE "remember=[0-9]+" | cut -d= -f2)
+    echo "${val:-0}"
+}
+
+get_tmout() {
+    local file="/etc/profile.d/tmout.sh"
+    [ ! -f "$file" ] && { echo "0"; return; }
+    local val
+    val=$(grep -oE "TMOUT=[0-9]+" "$file" | cut -d= -f2)
+    echo "${val:-0}"
+}
+
+get_astra_control_status() {
+    local cmd="$1"
+    if ! command -v "$cmd" &>/dev/null; then
+        echo "Не установлено"
+        return
+    fi
+    local status
+    status=$("$cmd" status 2>/dev/null)
+    if [[ "$status" == *"enabled"* || "$status" == *"активен"* || "$status" == *"включен"* ]]; then
+        echo "Включен"
+    else
+        echo "Выключен"
+    fi
+}
+
+check_class_compliance() {
+    # Вопрос 1: Тип системы
+    local sys_type
+    sys_type=$(whiptail --title "Тип системы (Вопрос 1 из 3)" \
+                        --cancel-button "Назад" \
+                        --menu "Укажите тип автоматизированной системы:" \
+                        15 76 2 \
+                        "1" "Однопользовательская система (класс 3)" \
+                        "2" "Многопользовательская система (класс 1 или 2)" \
+                        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    
+    # Вопрос 2: Права доступа (только если многопользовательская)
+    local rights_type="1"
+    if [ "$sys_type" = "2" ]; then
+        rights_type=$(whiptail --title "Доступ к информации (Вопрос 2 из 3)" \
+                              --cancel-button "Назад" \
+                              --menu "Укажите распределение прав доступа пользователей:" \
+                              15 76 2 \
+                              "1" "Одинаковые права доступа ко всей информации (класс 2)" \
+                              "2" "Разные права доступа к информации (класс 1)" \
+                              3>&1 1>&2 2>&3)
+        [ $? -ne 0 ] && return
+    fi
+    
+    # Вопрос 3: Максимальный уровень
+    local lvl_options=()
+    local has_mac_levels=false
+    if [ -f "/etc/parsec/mac_levels" ]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            [[ "$line" =~ ^# ]] && continue
+            [[ "$line" != *:* ]] && continue
+            local name="${line%%:*}"
+            local id="${line##*:}"
+            id=$(echo "$id" | tr -d ' \t\r\n')
+            if [[ "$id" =~ ^[0-9]+$ ]]; then
+                lvl_options+=("$id" "$name")
+                has_mac_levels=true
+            fi
+        done < "/etc/parsec/mac_levels"
+    fi
+    if [ "$has_mac_levels" = false ]; then
+        lvl_options=(
+            "0" "Несекретно"
+            "1" "ДСП (Конфиденциально)"
+            "2" "Секретно"
+            "3" "Совершенно секретно"
+        )
+    fi
+    
+    local max_level
+    max_level=$(whiptail --title "Максимальный гриф (Вопрос 3 из 3)" \
+                        --cancel-button "Назад" \
+                        --menu "Укажите максимальный гриф конфиденциальности информации в АС:" \
+                        18 76 6 \
+                        "${lvl_options[@]}" \
+                        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    
+    # Определение класса АС по РД 1992
+    local target_class=""
+    local class_desc=""
+    
+    if [ "$sys_type" = "1" ]; then
+        if [ "$max_level" = "1" ]; then
+            target_class="3Б"
+            class_desc="Однопользовательская АС для конфиденциальной информации"
+        else
+            target_class="3А"
+            class_desc="Однопользовательская АС для государственной тайны"
+        fi
+    elif [ "$rights_type" = "1" ]; then
+        if [ "$max_level" = "1" ]; then
+            target_class="2Б"
+            class_desc="Многопользовательская АС с одинаковыми правами для конфиденциальной информации"
+        else
+            target_class="2А"
+            class_desc="Многопользовательская АС с одинаковыми правами для государственной тайны"
+        fi
+    else
+        if [ "$max_level" = "1" ]; then
+            target_class="1Г"
+            class_desc="Многопользовательская АС с разными правами для конфиденциальной информации"
+        elif [ "$max_level" = "2" ]; then
+            target_class="1В"
+            class_desc="Многопользовательская АС для информации с грифом 'Секретно'"
+        elif [ "$max_level" = "3" ]; then
+            target_class="1Б"
+            class_desc="Многопользовательская АС для информации с грифом 'Совершенно секретно'"
+        else
+            target_class="1А"
+            class_desc="Многопользовательская АС для информации с грифом 'Особой важности'"
+        fi
+    fi
+    
+    # Инициализация целевых требований по классу
+    local req_len=0
+    local req_hist=0
+    local req_max_days=0
+    local req_deny=0
+    local req_unlock_time=0
+    local req_tmout=0
+    local req_secdel="optional"
+    local req_swap="optional"
+    local req_console="optional"
+    local req_ptrace="optional"
+    local req_interpreters="optional"
+    local req_audit="optional"
+    
+    case "$target_class" in
+        "3Б"|"2Б"|"1Д"|"1Г")
+            req_len=6
+            req_hist=0
+            req_max_days=180
+            req_deny=5
+            req_unlock_time=300
+            req_tmout=1800
+            ;;
+        "3А"|"2А"|"1В")
+            req_len=6
+            req_hist=1
+            req_max_days=90
+            req_deny=5
+            req_unlock_time=900
+            req_tmout=600
+            req_swap="Включен"
+            req_console="Включен"
+            req_ptrace="Включен"
+            req_audit="Включен"
+            ;;
+        "1Б")
+            req_len=8
+            req_hist=1
+            req_max_days=60
+            req_deny=3
+            req_unlock_time=1800
+            req_tmout=300
+            req_secdel="Включен"
+            req_swap="Включен"
+            req_console="Включен"
+            req_ptrace="Включен"
+            req_interpreters="Включен"
+            req_audit="Включен"
+            ;;
+        "1А")
+            req_len=8
+            req_hist=1
+            req_max_days=30
+            req_deny=3
+            req_unlock_time=3600
+            req_tmout=300
+            req_secdel="Включен"
+            req_swap="Включен"
+            req_console="Включен"
+            req_ptrace="Включен"
+            req_interpreters="Включен"
+            req_audit="Включен (строгие правила)"
+            ;;
+    esac
+    
+    local reports_dir="$ROOT_DIR/reports"
+    mkdir -p "$reports_dir"
+    if [ -n "$SUDO_UID" ] && [ -n "$SUDO_GID" ]; then
+        chown "$SUDO_UID:$SUDO_GID" "$reports_dir" 2>/dev/null
+    fi
+    local timestamp
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    local report_file="${reports_dir}/compliance_report_${target_class}_${timestamp}.txt"
+
+    echo "========================================================================" > "$report_file"
+    echo "         ОТЧЕТ КОНТРОЛЯ СООТВЕТСТВИЯ ТРЕБОВАНИЯМ РД АС (ГОСТЕХКОМИССИЯ)" >> "$report_file"
+    echo "========================================================================" >> "$report_file"
+    echo "Целевой класс защищенности АС: $target_class" >> "$report_file"
+    echo "Описание: $class_desc" >> "$report_file"
+    echo "------------------------------------------------------------------------" >> "$report_file"
+    echo "" >> "$report_file"
+    
+    # 1. Длина пароля
+    local cur_len
+    cur_len=$(get_pwquality_param "minlen")
+    if [ "$cur_len" -ge "$req_len" ]; then
+        echo -e "[  OK  ] Минимальная длина пароля: ${cur_len} (требуется >= ${req_len})" >> "$report_file"
+    else
+        echo -e "[  !!  ] Минимальная длина пароля: ${cur_len} (требуется >= ${req_len})" >> "$report_file"
+        echo -e "         -> РЕКОМЕНДАЦИЯ: Измените параметр 'minlen = ${req_len}' в /etc/security/pwquality.conf\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Политика паролей» -> «Минимальная длина»" >> "$report_file"
+    fi
+    
+    # 2. История паролей
+    local cur_hist
+    cur_hist=$(get_password_history)
+    if [ "$cur_hist" -ge "$req_hist" ]; then
+        echo -e "[  OK  ] История повторения паролей: ${cur_hist} (требуется >= ${req_hist})" >> "$report_file"
+    else
+        echo -e "[  !!  ] История повторения паролей: ${cur_hist} (требуется >= ${req_hist})" >> "$report_file"
+        echo -e "         -> РЕКОМЕНДАЦИЯ: Установите параметр 'remember=${req_hist}' для pam_unix.so в файле /etc/pam.d/common-password\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Политика паролей» -> «Хранить историю паролей»" >> "$report_file"
+    fi
+    
+    # 3. Время действия пароля
+    local cur_max_days
+    cur_max_days=$(get_logindefs_param "PASS_MAX_DAYS")
+    if [ "$cur_max_days" -le "$req_max_days" ] && [ "$cur_max_days" -gt 0 ]; then
+        echo -e "[  OK  ] Максимальный срок действия пароля: ${cur_max_days} дн. (требуется <= ${req_max_days} дн.)" >> "$report_file"
+    else
+        echo -e "[  !!  ] Максимальный срок действия пароля: ${cur_max_days} дн. (требуется <= ${req_max_days} дн.)" >> "$report_file"
+        echo -e "         -> РЕКОМЕНДАЦИЯ: Измените параметр 'PASS_MAX_DAYS ${req_max_days}' в файле /etc/login.defs\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Политика паролей» -> «Максимальный срок действия пароля»" >> "$report_file"
+    fi
+    
+    # 4. Блокировка попыток
+    local cur_deny="0"
+    local cur_time="0"
+    if [ -f "/etc/security/faillock.conf" ]; then
+        cur_deny=$(get_faillock_param "deny")
+        cur_time=$(get_faillock_param "unlock_time")
+    fi
+    if [ "$cur_deny" -le "$req_deny" ] && [ "$cur_deny" -gt 0 ]; then
+        echo -e "[  OK  ] Попыток до блокировки аккаунта: ${cur_deny} (требуется <= ${req_deny})" >> "$report_file"
+    else
+        echo -e "[  !!  ] Попыток до блокировки аккаунта: ${cur_deny} (требуется <= ${req_deny})" >> "$report_file"
+        echo -e "         -> РЕКОМЕНДАЦИЯ: Установите параметр 'deny = ${req_deny}' в /etc/security/faillock.conf\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Блокировка учетных записей» -> «Попыток входа до блокировки»" >> "$report_file"
+    fi
+    
+    # 5. Время блокировки
+    if [ "$cur_time" -eq 0 ] || [ "$cur_time" -ge "$req_unlock_time" ]; then
+        local display_time="${cur_time}с"
+        [ "$cur_time" -eq 0 ] && display_time="permanent (0)"
+        echo -e "[  OK  ] Время блокировки при подборе: ${display_time} (требуется >= ${req_unlock_time}с)" >> "$report_file"
+    else
+        echo -e "[  !!  ] Время блокировки при подборе: ${cur_time}с (требуется >= ${req_unlock_time}с)" >> "$report_file"
+        echo -e "         -> РЕКОМЕНДАЦИЯ: Установите параметр 'unlock_time = ${req_unlock_time}' (или 0 для бессрочной блокировки) в /etc/security/faillock.conf\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Блокировка учетных записей» -> «Время блокировки»" >> "$report_file"
+    fi
+    
+    # 6. Таймаут неактивности сессии
+    local cur_tmout
+    cur_tmout=$(get_tmout)
+    if [ "$cur_tmout" -le "$req_tmout" ] && [ "$cur_tmout" -gt 0 ]; then
+        echo -e "[  OK  ] Таймаут бездействия терминала: ${cur_tmout}с (требуется <= ${req_tmout}с)" >> "$report_file"
+    else
+        local status_tmout="${cur_tmout}с"
+        [ "$cur_tmout" -eq 0 ] && status_tmout="Выключен"
+        echo -e "[  !!  ] Таймаут бездействия терминала: ${status_tmout} (требуется <= ${req_tmout}с)" >> "$report_file"
+        echo -e "         -> РЕКОМЕНДАЦИЯ: Пропишите 'readonly TMOUT=${req_tmout}; export TMOUT' в файл /etc/profile.d/tmout.sh\n            или в GUI: «Настройка экрана» -> «Хранитель экрана» -> «Блокировать экран через...» (для графических сессий)" >> "$report_file"
+    fi
+    
+    # 7. Гарантированная очистка (SecDel)
+    if [ "$req_secdel" = "Включен" ]; then
+        local cur_secdel
+        cur_secdel=$(get_astra_control_status "astra-secdel-control")
+        if [ "$cur_secdel" = "Включен" ]; then
+            echo -e "[  OK  ] Безопасное удаление файлов (SecDel): Включено" >> "$report_file"
+        else
+            echo -e "[  !!  ] Безопасное удаление файлов (SecDel): Выключено (требуется Включено)" >> "$report_file"
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-secdel-control enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Очистка освобождаемых областей» -> «Безопасное удаление файлов»" >> "$report_file"
+        fi
+    fi
+    
+    # 8. Очистка Swap
+    if [ "$req_swap" = "Включен" ]; then
+        local cur_swap
+        cur_swap=$(get_astra_control_status "astra-swapwiper-control")
+        if [ "$cur_swap" = "Включен" ]; then
+            echo -e "[  OK  ] Гарантированная очистка Swap при выключении: Включено" >> "$report_file"
+        else
+            echo -e "[  !!  ] Гарантированная очистка Swap при выключении: Выключено (требуется Включено)" >> "$report_file"
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-swapwiper-control enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Очистка освобождаемых областей» -> «Очистка swap-раздела при выключении»" >> "$report_file"
+        fi
+    fi
+    
+    # 9. Блокировка консолей
+    if [ "$req_console" = "Включен" ]; then
+        local cur_console
+        cur_console=$(get_astra_control_status "astra-console-lock")
+        if [ "$cur_console" = "Включен" ]; then
+            echo -e "[  OK  ] Блокировка переключения TTY-консолей: Включено" >> "$report_file"
+        else
+            echo -e "[  !!  ] Блокировка переключения TTY-консолей: Выключено (требуется Включено)" >> "$report_file"
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-console-lock enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Режимы блокировки» -> «Блокировка переключения TTY-консолей»" >> "$report_file"
+        fi
+    fi
+    
+    # 10. Блокировка ptrace
+    if [ "$req_ptrace" = "Включен" ]; then
+        local cur_ptrace
+        cur_ptrace=$(get_astra_control_status "astra-ptrace-lock")
+        if [ "$cur_ptrace" = "Включен" ]; then
+            echo -e "[  OK  ] Блокировка трассировки процессов (ptrace): Включено" >> "$report_file"
+        else
+            echo -e "[  !!  ] Блокировка трассировки процессов (ptrace): Выключено (требуется Включено)" >> "$report_file"
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-ptrace-lock enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Режимы блокировки» -> «Блокировка трассировки процессов (ptrace)»" >> "$report_file"
+        fi
+    fi
+    
+    # 11. Блокировка интерпретаторов
+    if [ "$req_interpreters" = "Включен" ]; then
+        local cur_interpreters
+        cur_interpreters=$(get_astra_control_status "astra-interpreters-lock")
+        if [ "$cur_interpreters" = "Включен" ]; then
+            echo -e "[  OK  ] Ограничение консольных интерпретаторов: Включено" >> "$report_file"
+        else
+            echo -e "[  !!  ] Ограничение консольных интерпретаторов: Выключено (требуется Включено)" >> "$report_file"
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-interpreters-lock enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Режимы блокировки» -> «Ограничение консольных интерпретаторов»" >> "$report_file"
+        fi
+    fi
+    
+    # 12. Служба аудита auditd
+    if [ "$req_audit" != "optional" ]; then
+        local audit_active=false
+        systemctl is-active auditd &>/dev/null && audit_active=true
+        if [ "$audit_active" = true ]; then
+            echo -e "[  OK  ] Служба аудита безопасности auditd: Активна" >> "$report_file"
+            if [ "$target_class" = "1А" ]; then
+                local rule_file="/etc/audit/rules.d/audit.rules"
+                if [ -f "$rule_file" ] && grep -q "time-change" "$rule_file" && grep -q "identity" "$rule_file"; then
+                    echo -e "[  OK  ] Расширенные правила аудита для класса 1А: Соответствуют" >> "$report_file"
+                else
+                    echo -e "[  !!  ] Расширенные правила аудита для класса 1А: Не настроены" >> "$report_file"
+                    echo -e "         -> РЕКОМЕНДАЦИЯ: Настройте правила аудита для времени, ФС и учетных записей в $rule_file" >> "$report_file"
+                fi
+            fi
+        else
+            echo -e "[  !!  ] Служба аудита безопасности auditd: Выключена (требуется Включена)" >> "$report_file"
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните: 'sudo systemctl enable --now auditd'\n            или в GUI: «Панель управления» -> «Аудит событий»" >> "$report_file"
+        fi
+    fi
+    
+    echo "------------------------------------------------------------------------" >> "$report_file"
+    echo "                 КОНЕЦ ОТЧЕТА КОМПЛАЕНС-КОНТРОЛЯ" >> "$report_file"
+    echo "========================================================================" >> "$report_file"
+    
+    if [ -n "$SUDO_UID" ] && [ -n "$SUDO_GID" ]; then
+        chown "$SUDO_UID:$SUDO_GID" "$report_file" 2>/dev/null
+    fi
+    
+    whiptail --title "Отчет сохранен" --msgbox "Отчет соответствия требованиям РД АС успешно сохранен в:\n$report_file" 10 76
 }
 
 # ------------------------------------------------------------
@@ -1277,13 +1683,14 @@ while true; do
                       --cancel-button "Назад" \
                       --default-item "$default_choice" \
                       --menu "   ───┤ Управление: ↑/↓ - переход, Enter - выбор, Tab - кнопки ├───\n\nНастройте объем аудита безопасности АРМ:" \
-                      22 76 8 \
+                      22 76 9 \
                       "Системная информация и S/N" "[$status_sys]" \
                       "Учетные записи и доступ" "[$status_user]" \
                       "Безопасность файловой системы" "[$status_fs]" \
                       "Сеть и брандмауэр" "[$status_net]" \
                       "Механизмы защиты Astra Linux" "[$status_astra]" \
                       "Скриншоты графических окон" "[$status_screen]" \
+                      "Проверить соответствие классу защищенности" "" \
                       "Запустить проверку безопасности" "" \
                       "Выбрать окна для скриншотов" "" \
                       3>&1 1>&2 2>&3)
@@ -1354,6 +1761,9 @@ while true; do
                     whiptail --title "Ошибка" --msgbox "Ошибка: Ни локальная графическая сессия (:0), ни пересылка X11 по SSH не обнаружены. Снятие скриншотов невозможно!" 10 60
                 fi
             fi
+            ;;
+        "Проверить соответствие классу защищенности")
+            check_class_compliance
             ;;
         "Запустить проверку безопасности")
             execute_audit
