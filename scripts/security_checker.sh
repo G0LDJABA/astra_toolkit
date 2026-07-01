@@ -1414,7 +1414,7 @@ check_class_compliance() {
         fi
     fi
     
-    # Инициализация целевых требований по классу
+    # Инициализация целевых требований по классу (дефолтные значения)
     local req_len=0
     local req_hist=0
     local req_max_days=0
@@ -1428,56 +1428,100 @@ check_class_compliance() {
     local req_interpreters="optional"
     local req_audit="optional"
     
-    case "$target_class" in
-        "3Б"|"2Б"|"1Д"|"1Г")
-            req_len=6
-            req_hist=0
-            req_max_days=180
-            req_deny=5
-            req_unlock_time=300
-            req_tmout=1800
-            ;;
-        "3А"|"2А"|"1В")
-            req_len=6
-            req_hist=1
-            req_max_days=90
-            req_deny=5
-            req_unlock_time=900
-            req_tmout=600
-            req_swap="Включен"
-            req_console="Включен"
-            req_ptrace="Включен"
-            req_audit="Включен"
-            ;;
-        "1Б")
-            req_len=8
-            req_hist=1
-            req_max_days=60
-            req_deny=3
-            req_unlock_time=1800
-            req_tmout=300
-            req_secdel="Включен"
-            req_swap="Включен"
-            req_console="Включен"
-            req_ptrace="Включен"
-            req_interpreters="Включен"
-            req_audit="Включен"
-            ;;
-        "1А")
-            req_len=8
-            req_hist=1
-            req_max_days=30
-            req_deny=3
-            req_unlock_time=3600
-            req_tmout=300
-            req_secdel="Включен"
-            req_swap="Включен"
-            req_console="Включен"
-            req_ptrace="Включен"
-            req_interpreters="Включен"
-            req_audit="Включен (строгие правила)"
-            ;;
-    esac
+    local config_file="$ROOT_DIR/service/compliance_standards.conf"
+    local config_loaded=false
+    
+    if [ -f "$config_file" ]; then
+        # Извлекаем строки из нужной секции в INI-файле
+        # sed находит секцию [$target_class] и печатает строки до следующей секции [
+        local section_content
+        section_content=$(sed -n "/^\[$target_class\]/,/^\[/p" "$config_file" | tr -d '\r' | grep -v -E '^\[|^#|^\s*$')
+        
+        if [ -n "$section_content" ]; then
+            config_loaded=true
+            while IFS= read -r line; do
+                [ -z "$line" ] && continue
+                if [[ "$line" =~ ^[a-zA-Z_][a-zA-Z0-9_]*=.*$ ]]; then
+                    local var_name="${line%%=*}"
+                    local var_value="${line#*=}"
+                    # Удаляем кавычки, если они есть
+                    var_value="${var_value#\"}"
+                    var_value="${var_value%\"}"
+                    var_value="${var_value#\'}"
+                    var_value="${var_value%\'}"
+                    
+                    case "$var_name" in
+                        req_len) req_len="$var_value" ;;
+                        req_hist) req_hist="$var_value" ;;
+                        req_max_days) req_max_days="$var_value" ;;
+                        req_deny) req_deny="$var_value" ;;
+                        req_unlock_time) req_unlock_time="$var_value" ;;
+                        req_tmout) req_tmout="$var_value" ;;
+                        req_secdel) req_secdel="$var_value" ;;
+                        req_swap) req_swap="$var_value" ;;
+                        req_console) req_console="$var_value" ;;
+                        req_ptrace) req_ptrace="$var_value" ;;
+                        req_interpreters) req_interpreters="$var_value" ;;
+                        req_audit) req_audit="$var_value" ;;
+                    esac
+                fi
+            done <<< "$section_content"
+        fi
+    fi
+
+    if [ "$config_loaded" = false ]; then
+        # Если файл конфигурации отсутствует или пуст, используем жестко зашитые дефолтные требования
+        case "$target_class" in
+            "3Б"|"2Б"|"1Д"|"1Г")
+                req_len=6
+                req_hist=0
+                req_max_days=180
+                req_deny=5
+                req_unlock_time=300
+                req_tmout=1800
+                ;;
+            "3А"|"2А"|"1В")
+                req_len=6
+                req_hist=1
+                req_max_days=90
+                req_deny=5
+                req_unlock_time=900
+                req_tmout=600
+                req_swap="Включен"
+                req_console="Включен"
+                req_ptrace="Включен"
+                req_audit="Включен"
+                ;;
+            "1Б")
+                req_len=8
+                req_hist=1
+                req_max_days=60
+                req_deny=3
+                req_unlock_time=1800
+                req_tmout=300
+                req_secdel="Включен"
+                req_swap="Включен"
+                req_console="Включен"
+                req_ptrace="Включен"
+                req_interpreters="Включен"
+                req_audit="Включен"
+                ;;
+            "1А")
+                req_len=8
+                req_hist=1
+                req_max_days=30
+                req_deny=3
+                req_unlock_time=3600
+                req_tmout=300
+                req_secdel="Включен"
+                req_swap="Включен"
+                req_console="Включен"
+                req_ptrace="Включен"
+                req_interpreters="Включен"
+                req_audit="Включен (строгие правила)"
+                ;;
+        esac
+    fi
     
     local reports_dir="$ROOT_DIR/reports"
     mkdir -p "$reports_dir"
