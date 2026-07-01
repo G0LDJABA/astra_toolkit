@@ -1523,7 +1523,7 @@ check_class_compliance() {
         esac
     fi
     
-    local reports_dir="$ROOT_DIR/reports"
+    local reports_dir="$ROOT_DIR/report"
     mkdir -p "$reports_dir"
     if [ -n "$SUDO_UID" ] && [ -n "$SUDO_GID" ]; then
         chown "$SUDO_UID:$SUDO_GID" "$reports_dir" 2>/dev/null
