@@ -1318,6 +1318,94 @@ get_astra_control_status() {
     fi
 }
 
+apply_remediation_pwquality() {
+    local req_val="$1"
+    local file="/etc/security/pwquality.conf"
+    [ ! -f "$file" ] && return 1
+    if grep -qE "^\s*#?\s*minlen\s*=" "$file"; then
+        sed -i -E "s/^\s*#?\s*minlen\s*=\s*.*/minlen = $req_val/" "$file"
+    else
+        echo "minlen = $req_val" >> "$file"
+    fi
+}
+
+apply_remediation_pam_history() {
+    local req_val="$1"
+    local file="/etc/pam.d/common-password"
+    [ ! -f "$file" ] && return 1
+    if grep -q "pam_unix.so" "$file"; then
+        if grep -qE "pam_unix.so.*remember=" "$file"; then
+            sed -i -E "s/(pam_unix.so.*)remember=[0-9]+/\1remember=$req_val/" "$file"
+        else
+            sed -i -E "s/(pam_unix.so.*)/\1 remember=$req_val/" "$file"
+        fi
+    fi
+}
+
+apply_remediation_logindefs() {
+    local key="$1"
+    local req_val="$2"
+    local file="/etc/login.defs"
+    [ ! -f "$file" ] && return 1
+    if grep -qE "^\s*#?\s*${key}\s+" "$file"; then
+        sed -i -E "s/^\s*#?\s*${key}\s+[0-9]+/${key}   $req_val/" "$file"
+    else
+        echo "${key}   $req_val" >> "$file"
+    fi
+}
+
+apply_remediation_faillock() {
+    local key="$1"
+    local req_val="$2"
+    local file="/etc/security/faillock.conf"
+    [ ! -f "$file" ] && return 1
+    if grep -qE "^\s*#?\s*${key}\s*=" "$file"; then
+        sed -i -E "s/^\s*#?\s*${key}\s*=\s*.*/${key} = $req_val/" "$file"
+    else
+        echo "${key} = $req_val" >> "$file"
+    fi
+}
+
+apply_remediation_tmout() {
+    local req_val="$1"
+    local file="/etc/profile.d/tmout.sh"
+    mkdir -p "$(dirname "$file")"
+    echo "readonly TMOUT=$req_val" > "$file"
+    echo "export TMOUT" >> "$file"
+    chmod +x "$file"
+}
+
+apply_remediation_astra_control() {
+    local cmd="$1"
+    if ! command -v "$cmd" &>/dev/null; then
+        return 1
+    fi
+    "$cmd" enable >/dev/null 2>&1
+}
+
+apply_remediation_auditd() {
+    local target_class="$1"
+    systemctl enable --now auditd >/dev/null 2>&1
+    if [ "$target_class" = "1А" ]; then
+        local rule_file="/etc/audit/rules.d/audit.rules"
+        if [ ! -f "$rule_file" ]; then
+            mkdir -p "$(dirname "$rule_file")"
+            touch "$rule_file"
+        fi
+        if ! grep -q "time-change" "$rule_file"; then
+            echo "-w /etc/localtime -p wa -k time-change" >> "$rule_file"
+        fi
+        if ! grep -q "identity" "$rule_file"; then
+            echo "-w /etc/group -p wa -k identity" >> "$rule_file"
+            echo "-w /etc/passwd -p wa -k identity" >> "$rule_file"
+            echo "-w /etc/gshadow -p wa -k identity" >> "$rule_file"
+            echo "-w /etc/shadow -p wa -k identity" >> "$rule_file"
+            echo "-w /etc/security/opasswd -p wa -k identity" >> "$rule_file"
+        fi
+        service auditd restart >/dev/null 2>&1 || systemctl restart auditd >/dev/null 2>&1
+    fi
+}
+
 check_class_compliance() {
     # Вопрос 1: Тип системы
     local sys_type
@@ -1523,6 +1611,330 @@ check_class_compliance() {
         esac
     fi
     
+    # ------------------------------------------------------------
+    # ПЕРВЫЙ ЭТАП: Замер текущих показателей системы
+    # ------------------------------------------------------------
+    local status_len=false
+    local status_hist=false
+    local status_max_days=false
+    local status_deny=false
+    local status_unlock_time=false
+    local status_tmout=false
+    local status_secdel="optional"
+    local status_swap="optional"
+    local status_console="optional"
+    local status_ptrace="optional"
+    local status_interpreters="optional"
+    local status_audit="optional"
+
+    # Замер длины пароля
+    local cur_len
+    cur_len=$(get_pwquality_param "minlen")
+    [ "$cur_len" -ge "$req_len" ] && status_len=true
+
+    # Замер истории паролей
+    local cur_hist
+    cur_hist=$(get_password_history)
+    [ "$cur_hist" -ge "$req_hist" ] && status_hist=true
+
+    # Замер срока действия паролей
+    local cur_max_days
+    cur_max_days=$(get_logindefs_param "PASS_MAX_DAYS")
+    [ "$cur_max_days" -le "$req_max_days" ] && [ "$cur_max_days" -gt 0 ] && status_max_days=true
+
+    # Замер попыток и времени блокировки
+    local cur_deny="0"
+    local cur_time="0"
+    if [ -f "/etc/security/faillock.conf" ]; then
+        cur_deny=$(get_faillock_param "deny")
+        cur_time=$(get_faillock_param "unlock_time")
+    fi
+    [ "$cur_deny" -le "$req_deny" ] && [ "$cur_deny" -gt 0 ] && status_deny=true
+    ( [ "$cur_time" -eq 0 ] || [ "$cur_time" -ge "$req_unlock_time" ] ) && status_unlock_time=true
+
+    # Замер таймаута сессии
+    local cur_tmout
+    cur_tmout=$(get_tmout)
+    [ "$cur_tmout" -le "$req_tmout" ] && [ "$cur_tmout" -gt 0 ] && status_tmout=true
+
+    # Замер блокировок Astra
+    local cur_secdel="optional"
+    if [ "$req_secdel" = "Включен" ]; then
+        cur_secdel=$(get_astra_control_status "astra-secdel-control")
+        if [ "$cur_secdel" = "Включен" ]; then status_secdel=true; else status_secdel=false; fi
+    fi
+
+    local cur_swap="optional"
+    if [ "$req_swap" = "Включен" ]; then
+        cur_swap=$(get_astra_control_status "astra-swapwiper-control")
+        if [ "$cur_swap" = "Включен" ]; then status_swap=true; else status_swap=false; fi
+    fi
+
+    local cur_console="optional"
+    if [ "$req_console" = "Включен" ]; then
+        cur_console=$(get_astra_control_status "astra-console-lock")
+        if [ "$cur_console" = "Включен" ]; then status_console=true; else status_console=false; fi
+    fi
+
+    local cur_ptrace="optional"
+    if [ "$req_ptrace" = "Включен" ]; then
+        cur_ptrace=$(get_astra_control_status "astra-ptrace-lock")
+        if [ "$cur_ptrace" = "Включен" ]; then status_ptrace=true; else status_ptrace=false; fi
+    fi
+
+    local cur_interpreters="optional"
+    if [ "$req_interpreters" = "Включен" ]; then
+        cur_interpreters=$(get_astra_control_status "astra-interpreters-lock")
+        if [ "$cur_interpreters" = "Включен" ]; then status_interpreters=true; else status_interpreters=false; fi
+    fi
+
+    # Замер auditd
+    local cur_audit="optional"
+    local audit_active=false
+    local audit_rules_ok=false
+    if [ "$req_audit" != "optional" ]; then
+        systemctl is-active auditd &>/dev/null && audit_active=true
+        if [ "$audit_active" = true ]; then
+            if [ "$target_class" = "1А" ]; then
+                local rule_file="/etc/audit/rules.d/audit.rules"
+                if [ -f "$rule_file" ] && grep -q "time-change" "$rule_file" && grep -q "identity" "$rule_file"; then
+                    audit_rules_ok=true
+                    status_audit=true
+                else
+                    status_audit=false
+                fi
+            else
+                status_audit=true
+            fi
+        else
+            status_audit=false
+        fi
+    fi
+
+    # ------------------------------------------------------------
+    # ФОРМИРОВАНИЕ СПИСКА НЕСOОТВЕТСТВИЙ ДЛЯ ВЫБОРА (CHECKLIST)
+    # ------------------------------------------------------------
+    local failed_list=()
+    
+    if [ "$status_len" = false ]; then
+        failed_list+=("minlen" "Минимальная длина пароля: $cur_len (требуется >= $req_len)" "ON")
+    fi
+    if [ "$status_hist" = false ]; then
+        failed_list+=("remember" "История повторения паролей: $cur_hist (требуется >= $req_hist)" "ON")
+    fi
+    if [ "$status_max_days" = false ]; then
+        failed_list+=("pass_max_days" "Макс. срок действия пароля: $cur_max_days дн. (требуется <= $req_max_days дн.)" "ON")
+    fi
+    if [ "$status_deny" = false ]; then
+        failed_list+=("deny" "Попыток до блокировки: $cur_deny (требуется <= $req_deny)" "ON")
+    fi
+    if [ "$status_unlock_time" = false ]; then
+        local display_time="${cur_time}с"
+        [ "$cur_time" -eq 0 ] && display_time="permanent"
+        failed_list+=("unlock_time" "Время блокировки при подборе: $display_time (требуется >= ${req_unlock_time}с)" "ON")
+    fi
+    if [ "$status_tmout" = false ]; then
+        local status_tmout_disp="${cur_tmout}с"
+        [ "$cur_tmout" -eq 0 ] && status_tmout_disp="Выключен"
+        failed_list+=("tmout" "Таймаут бездействия терминала: $status_tmout_disp (требуется <= ${req_tmout}с)" "ON")
+    fi
+    if [ "$status_secdel" = false ]; then
+        failed_list+=("secdel" "Включить безопасное удаление файлов (SecDel) (сейчас $cur_secdel)" "ON")
+    fi
+    if [ "$status_swap" = false ]; then
+        failed_list+=("swap" "Включить очистку Swap при выключении (сейчас $cur_swap)" "ON")
+    fi
+    if [ "$status_console" = false ]; then
+        failed_list+=("console" "Включить блокировку переключения TTY-консолей (сейчас $cur_console)" "ON")
+    fi
+    if [ "$status_ptrace" = false ]; then
+        failed_list+=("ptrace" "Включить блокировку трассировки ptrace (сейчас $cur_ptrace)" "ON")
+    fi
+    if [ "$status_interpreters" = false ]; then
+        failed_list+=("interpreters" "Включить ограничение интерпретаторов (сейчас $cur_interpreters)" "ON")
+    fi
+    if [ "$status_audit" = false ]; then
+        local audit_desc="Включить и запустить службу аудит безопасности auditd"
+        [ "$target_class" = "1А" ] && audit_desc="Настроить расширенные правила аудита для класса 1А"
+        failed_list+=("auditd" "$audit_desc" "ON")
+    fi
+
+    # ------------------------------------------------------------
+    # ПРИМЕНЕНИЕ АВТОИСПРАВЛЕНИЙ (ЕСЛИ ВЫБРАНО ПОЛЬЗОВАТЕЛЕМ)
+    # ------------------------------------------------------------
+    local selected_fixes=()
+    local checklist_exit=1
+    
+    if [ ${#failed_list[@]} -gt 0 ]; then
+        local response
+        response=$(whiptail --title "Несоответствия классу $target_class" \
+                            --checklist "Выявлены несоответствия требованиям безопасности.\nОтметьте параметры, которые необходимо исправить автоматически:" \
+                            22 78 12 \
+                            "${failed_list[@]}" \
+                            3>&1 1>&2 2>&3)
+        checklist_exit=$?
+        if [ $checklist_exit -eq 0 ]; then
+            local item
+            for item in $response; do
+                item="${item%\"}"
+                item="${item#\"}"
+                selected_fixes+=("$item")
+            done
+        fi
+    fi
+
+    local fix_len="none"
+    local fix_hist="none"
+    local fix_max_days="none"
+    local fix_deny="none"
+    local fix_unlock_time="none"
+    local fix_tmout="none"
+    local fix_secdel="none"
+    local fix_swap="none"
+    local fix_console="none"
+    local fix_ptrace="none"
+    local fix_interpreters="none"
+    local fix_audit="none"
+
+    has_element() {
+        local el="$1"
+        shift
+        local e
+        for e in "$@"; do
+            [ "$e" = "$el" ] && return 0
+        done
+        return 1
+    }
+
+    if [ ${#selected_fixes[@]} -gt 0 ]; then
+        if has_element "minlen" "${selected_fixes[@]}"; then
+            if apply_remediation_pwquality "$req_len"; then fix_len="fixed"; else fix_len="error"; fi
+        fi
+        if has_element "remember" "${selected_fixes[@]}"; then
+            if apply_remediation_pam_history "$req_hist"; then fix_hist="fixed"; else fix_hist="error"; fi
+        fi
+        if has_element "pass_max_days" "${selected_fixes[@]}"; then
+            if apply_remediation_logindefs "PASS_MAX_DAYS" "$req_max_days"; then fix_max_days="fixed"; else fix_max_days="error"; fi
+        fi
+        if has_element "deny" "${selected_fixes[@]}"; then
+            if apply_remediation_faillock "deny" "$req_deny"; then fix_deny="fixed"; else fix_deny="error"; fi
+        fi
+        if has_element "unlock_time" "${selected_fixes[@]}"; then
+            if apply_remediation_faillock "unlock_time" "$req_unlock_time"; then fix_unlock_time="fixed"; else fix_unlock_time="error"; fi
+        fi
+        if has_element "tmout" "${selected_fixes[@]}"; then
+            if apply_remediation_tmout "$req_tmout"; then fix_tmout="fixed"; else fix_tmout="error"; fi
+        fi
+        if has_element "secdel" "${selected_fixes[@]}"; then
+            if ! command -v "astra-secdel-control" &>/dev/null; then
+                fix_secdel="no_util"
+            elif apply_remediation_astra_control "astra-secdel-control"; then
+                fix_secdel="fixed"
+            else
+                fix_secdel="error"
+            fi
+        fi
+        if has_element "swap" "${selected_fixes[@]}"; then
+            if ! command -v "astra-swapwiper-control" &>/dev/null; then
+                fix_swap="no_util"
+            elif apply_remediation_astra_control "astra-swapwiper-control"; then
+                fix_swap="fixed"
+            else
+                fix_swap="error"
+            fi
+        fi
+        if has_element "console" "${selected_fixes[@]}"; then
+            if ! command -v "astra-console-lock" &>/dev/null; then
+                fix_console="no_util"
+            elif apply_remediation_astra_control "astra-console-lock"; then
+                fix_console="fixed"
+            else
+                fix_console="error"
+            fi
+        fi
+        if has_element "ptrace" "${selected_fixes[@]}"; then
+            if ! command -v "astra-ptrace-lock" &>/dev/null; then
+                fix_ptrace="no_util"
+            elif apply_remediation_astra_control "astra-ptrace-lock"; then
+                fix_ptrace="fixed"
+            else
+                fix_ptrace="error"
+            fi
+        fi
+        if has_element "interpreters" "${selected_fixes[@]}"; then
+            if ! command -v "astra-interpreters-lock" &>/dev/null; then
+                fix_interpreters="no_util"
+            elif apply_remediation_astra_control "astra-interpreters-lock"; then
+                fix_interpreters="fixed"
+            else
+                fix_interpreters="error"
+            fi
+        fi
+        if has_element "auditd" "${selected_fixes[@]}"; then
+            if apply_remediation_auditd "$target_class"; then fix_audit="fixed"; else fix_audit="error"; fi
+        fi
+    fi
+
+    # ------------------------------------------------------------
+    # ВТОРОЙ ЭТАП: Контрольные замеры итогового состояния
+    # ------------------------------------------------------------
+    local final_len
+    final_len=$(get_pwquality_param "minlen")
+    
+    local final_hist
+    final_hist=$(get_password_history)
+    
+    local final_max_days
+    final_max_days=$(get_logindefs_param "PASS_MAX_DAYS")
+    
+    local final_deny="0"
+    local final_time="0"
+    if [ -f "/etc/security/faillock.conf" ]; then
+        final_deny=$(get_faillock_param "deny")
+        final_time=$(get_faillock_param "unlock_time")
+    fi
+    
+    local final_tmout
+    final_tmout=$(get_tmout)
+    
+    local final_secdel="optional"
+    [ "$req_secdel" = "Включен" ] && final_secdel=$(get_astra_control_status "astra-secdel-control")
+    
+    local final_swap="optional"
+    [ "$req_swap" = "Включен" ] && final_swap=$(get_astra_control_status "astra-swapwiper-control")
+    
+    local final_console="optional"
+    [ "$req_console" = "Включен" ] && final_console=$(get_astra_control_status "astra-console-lock")
+    
+    local final_ptrace="optional"
+    [ "$req_ptrace" = "Включен" ] && final_ptrace=$(get_astra_control_status "astra-ptrace-lock")
+    
+    local final_interpreters="optional"
+    [ "$req_interpreters" = "Включен" ] && final_interpreters=$(get_astra_control_status "astra-interpreters-lock")
+    
+    local final_audit="optional"
+    if [ "$req_audit" != "optional" ]; then
+        local final_audit_active=false
+        systemctl is-active auditd &>/dev/null && final_audit_active=true
+        if [ "$final_audit_active" = true ]; then
+            if [ "$target_class" = "1А" ]; then
+                local final_rule_file="/etc/audit/rules.d/audit.rules"
+                if [ -f "$final_rule_file" ] && grep -q "time-change" "$final_rule_file" && grep -q "identity" "$final_rule_file"; then
+                    final_audit="Включен"
+                else
+                    final_audit="Не настроен"
+                fi
+            else
+                final_audit="Включен"
+            fi
+        else
+            final_audit="Выключен"
+        fi
+    fi
+
+    # ------------------------------------------------------------
+    # ГЕНЕРАЦИЯ ДВУХЭТАПНОГО ОТЧЕТА СООТВЕТСТВИЯ
+    # ------------------------------------------------------------
     local reports_dir="$ROOT_DIR/report"
     mkdir -p "$reports_dir"
     if [ -n "$SUDO_UID" ] && [ -n "$SUDO_GID" ]; then
@@ -1541,149 +1953,198 @@ check_class_compliance() {
     echo "" >> "$report_file"
     
     # 1. Длина пароля
-    local cur_len
-    cur_len=$(get_pwquality_param "minlen")
-    if [ "$cur_len" -ge "$req_len" ]; then
-        echo -e "[  OK  ] Минимальная длина пароля: ${cur_len} (требуется >= ${req_len})" >> "$report_file"
-    else
-        echo -e "[  !!  ] Минимальная длина пароля: ${cur_len} (требуется >= ${req_len})" >> "$report_file"
+    local label_len="[  !!  ]"
+    if [ "$status_len" = true ]; then
+        label_len="[  OK  ]"
+    elif [ "$final_len" -ge "$req_len" ]; then
+        label_len="[ИСПРАВЛЕНО]"
+    fi
+    echo -e "${label_len} Минимальная длина пароля: ${final_len} (требуется >= ${req_len})" >> "$report_file"
+    if [ "$label_len" = "[  !!  ]" ]; then
         echo -e "         -> РЕКОМЕНДАЦИЯ: Измените параметр 'minlen = ${req_len}' в /etc/security/pwquality.conf\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Политика паролей» -> «Минимальная длина»" >> "$report_file"
     fi
     
     # 2. История паролей
-    local cur_hist
-    cur_hist=$(get_password_history)
-    if [ "$cur_hist" -ge "$req_hist" ]; then
-        echo -e "[  OK  ] История повторения паролей: ${cur_hist} (требуется >= ${req_hist})" >> "$report_file"
-    else
-        echo -e "[  !!  ] История повторения паролей: ${cur_hist} (требуется >= ${req_hist})" >> "$report_file"
+    local label_hist="[  !!  ]"
+    if [ "$status_hist" = true ]; then
+        label_hist="[  OK  ]"
+    elif [ "$final_hist" -ge "$req_hist" ]; then
+        label_hist="[ИСПРАВЛЕНО]"
+    fi
+    echo -e "${label_hist} История повторения паролей: ${final_hist} (требуется >= ${req_hist})" >> "$report_file"
+    if [ "$label_hist" = "[  !!  ]" ]; then
         echo -e "         -> РЕКОМЕНДАЦИЯ: Установите параметр 'remember=${req_hist}' для pam_unix.so в файле /etc/pam.d/common-password\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Политика паролей» -> «Хранить историю паролей»" >> "$report_file"
     fi
     
     # 3. Время действия пароля
-    local cur_max_days
-    cur_max_days=$(get_logindefs_param "PASS_MAX_DAYS")
-    if [ "$cur_max_days" -le "$req_max_days" ] && [ "$cur_max_days" -gt 0 ]; then
-        echo -e "[  OK  ] Максимальный срок действия пароля: ${cur_max_days} дн. (требуется <= ${req_max_days} дн.)" >> "$report_file"
-    else
-        echo -e "[  !!  ] Максимальный срок действия пароля: ${cur_max_days} дн. (требуется <= ${req_max_days} дн.)" >> "$report_file"
+    local label_max_days="[  !!  ]"
+    if [ "$status_max_days" = true ]; then
+        label_max_days="[  OK  ]"
+    elif [ "$final_max_days" -le "$req_max_days" ] && [ "$final_max_days" -gt 0 ]; then
+        label_max_days="[ИСПРАВЛЕНО]"
+    fi
+    echo -e "${label_max_days} Максимальный срок действия пароля: ${final_max_days} дн. (требуется <= ${req_max_days} дн.)" >> "$report_file"
+    if [ "$label_max_days" = "[  !!  ]" ]; then
         echo -e "         -> РЕКОМЕНДАЦИЯ: Измените параметр 'PASS_MAX_DAYS ${req_max_days}' в файле /etc/login.defs\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Политика паролей» -> «Максимальный срок действия пароля»" >> "$report_file"
     fi
     
     # 4. Блокировка попыток
-    local cur_deny="0"
-    local cur_time="0"
-    if [ -f "/etc/security/faillock.conf" ]; then
-        cur_deny=$(get_faillock_param "deny")
-        cur_time=$(get_faillock_param "unlock_time")
+    local label_deny="[  !!  ]"
+    if [ "$status_deny" = true ]; then
+        label_deny="[  OK  ]"
+    elif [ "$final_deny" -le "$req_deny" ] && [ "$final_deny" -gt 0 ]; then
+        label_deny="[ИСПРАВЛЕНО]"
     fi
-    if [ "$cur_deny" -le "$req_deny" ] && [ "$cur_deny" -gt 0 ]; then
-        echo -e "[  OK  ] Попыток до блокировки аккаунта: ${cur_deny} (требуется <= ${req_deny})" >> "$report_file"
-    else
-        echo -e "[  !!  ] Попыток до блокировки аккаунта: ${cur_deny} (требуется <= ${req_deny})" >> "$report_file"
+    echo -e "${label_deny} Попыток до блокировки аккаунта: ${final_deny} (требуется <= ${req_deny})" >> "$report_file"
+    if [ "$label_deny" = "[  !!  ]" ]; then
         echo -e "         -> РЕКОМЕНДАЦИЯ: Установите параметр 'deny = ${req_deny}' в /etc/security/faillock.conf\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Блокировка учетных записей» -> «Попыток входа до блокировки»" >> "$report_file"
     fi
     
     # 5. Время блокировки
-    if [ "$cur_time" -eq 0 ] || [ "$cur_time" -ge "$req_unlock_time" ]; then
-        local display_time="${cur_time}с"
-        [ "$cur_time" -eq 0 ] && display_time="permanent (0)"
-        echo -e "[  OK  ] Время блокировки при подборе: ${display_time} (требуется >= ${req_unlock_time}с)" >> "$report_file"
-    else
-        echo -e "[  !!  ] Время блокировки при подборе: ${cur_time}с (требуется >= ${req_unlock_time}с)" >> "$report_file"
+    local label_unlock_time="[  !!  ]"
+    if [ "$status_unlock_time" = true ]; then
+        label_unlock_time="[  OK  ]"
+    elif [ "$final_time" -eq 0 ] || [ "$final_time" -ge "$req_unlock_time" ]; then
+        label_unlock_time="[ИСПРАВЛЕНО]"
+    fi
+    local display_final_time="${final_time}с"
+    [ "$final_time" -eq 0 ] && display_final_time="permanent (0)"
+    echo -e "${label_unlock_time} Время блокировки при подборе: ${display_final_time} (требуется >= ${req_unlock_time}с)" >> "$report_file"
+    if [ "$label_unlock_time" = "[  !!  ]" ]; then
         echo -e "         -> РЕКОМЕНДАЦИЯ: Установите параметр 'unlock_time = ${req_unlock_time}' (или 0 для бессрочной блокировки) в /etc/security/faillock.conf\n            или в GUI: «Локальная политика безопасности» -> «Политика учетных записей» -> «Блокировка учетных записей» -> «Время блокировки»" >> "$report_file"
     fi
     
     # 6. Таймаут неактивности сессии
-    local cur_tmout
-    cur_tmout=$(get_tmout)
-    if [ "$cur_tmout" -le "$req_tmout" ] && [ "$cur_tmout" -gt 0 ]; then
-        echo -e "[  OK  ] Таймаут бездействия терминала: ${cur_tmout}с (требуется <= ${req_tmout}с)" >> "$report_file"
-    else
-        local status_tmout="${cur_tmout}с"
-        [ "$cur_tmout" -eq 0 ] && status_tmout="Выключен"
-        echo -e "[  !!  ] Таймаут бездействия терминала: ${status_tmout} (требуется <= ${req_tmout}с)" >> "$report_file"
+    local label_tmout="[  !!  ]"
+    if [ "$status_tmout" = true ]; then
+        label_tmout="[  OK  ]"
+    elif [ "$final_tmout" -le "$req_tmout" ] && [ "$final_tmout" -gt 0 ]; then
+        label_tmout="[ИСПРАВЛЕНО]"
+    fi
+    local display_final_tmout="${final_tmout}с"
+    [ "$final_tmout" -eq 0 ] && display_final_tmout="Выключен"
+    echo -e "${label_tmout} Таймаут бездействия терминала: ${display_final_tmout} (требуется <= ${req_tmout}с)" >> "$report_file"
+    if [ "$label_tmout" = "[  !!  ]" ]; then
         echo -e "         -> РЕКОМЕНДАЦИЯ: Пропишите 'readonly TMOUT=${req_tmout}; export TMOUT' в файл /etc/profile.d/tmout.sh\n            или в GUI: «Настройка экрана» -> «Хранитель экрана» -> «Блокировать экран через...» (для графических сессий)" >> "$report_file"
     fi
     
     # 7. Гарантированная очистка (SecDel)
     if [ "$req_secdel" = "Включен" ]; then
-        local cur_secdel
-        cur_secdel=$(get_astra_control_status "astra-secdel-control")
-        if [ "$cur_secdel" = "Включен" ]; then
-            echo -e "[  OK  ] Безопасное удаление файлов (SecDel): Включено" >> "$report_file"
-        else
-            echo -e "[  !!  ] Безопасное удаление файлов (SecDel): Выключено (требуется Включено)" >> "$report_file"
+        local label_secdel="[  !!  ]"
+        if [ "$status_secdel" = true ]; then
+            label_secdel="[  OK  ]"
+        elif [ "$fix_secdel" = "no_util" ]; then
+            label_secdel="[  !!  ] (Утилита не установлена)"
+        elif [ "$final_secdel" = "Включен" ]; then
+            label_secdel="[ИСПРАВЛЕНО]"
+        fi
+        echo -e "${label_secdel} Безопасное удаление файлов (SecDel): ${final_secdel}" >> "$report_file"
+        if [ "$label_secdel" = "[  !!  ]" ]; then
             echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-secdel-control enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Очистка освобождаемых областей» -> «Безопасное удаление файлов»" >> "$report_file"
+        elif [ "$label_secdel" = "[  !!  ] (Утилита не установлена)" ]; then
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Установите пакет astra-secdel-control с помощью APT." >> "$report_file"
         fi
     fi
     
     # 8. Очистка Swap
     if [ "$req_swap" = "Включен" ]; then
-        local cur_swap
-        cur_swap=$(get_astra_control_status "astra-swapwiper-control")
-        if [ "$cur_swap" = "Включен" ]; then
-            echo -e "[  OK  ] Гарантированная очистка Swap при выключении: Включено" >> "$report_file"
-        else
-            echo -e "[  !!  ] Гарантированная очистка Swap при выключении: Выключено (требуется Включено)" >> "$report_file"
+        local label_swap="[  !!  ]"
+        if [ "$status_swap" = true ]; then
+            label_swap="[  OK  ]"
+        elif [ "$fix_swap" = "no_util" ]; then
+            label_swap="[  !!  ] (Утилита не установлена)"
+        elif [ "$final_swap" = "Включен" ]; then
+            label_swap="[ИСПРАВЛЕНО]"
+        fi
+        echo -e "${label_swap} Гарантированная очистка Swap при выключении: ${final_swap}" >> "$report_file"
+        if [ "$label_swap" = "[  !!  ]" ]; then
             echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-swapwiper-control enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Очистка освобождаемых областей» -> «Очистка swap-раздела при выключении»" >> "$report_file"
+        elif [ "$label_swap" = "[  !!  ] (Утилита не установлена)" ]; then
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Установите пакет astra-swapwiper-control с помощью APT." >> "$report_file"
         fi
     fi
     
     # 9. Блокировка консолей
     if [ "$req_console" = "Включен" ]; then
-        local cur_console
-        cur_console=$(get_astra_control_status "astra-console-lock")
-        if [ "$cur_console" = "Включен" ]; then
-            echo -e "[  OK  ] Блокировка переключения TTY-консолей: Включено" >> "$report_file"
-        else
-            echo -e "[  !!  ] Блокировка переключения TTY-консолей: Выключено (требуется Включено)" >> "$report_file"
+        local label_console="[  !!  ]"
+        if [ "$status_console" = true ]; then
+            label_console="[  OK  ]"
+        elif [ "$fix_console" = "no_util" ]; then
+            label_console="[  !!  ] (Утилита не установлена)"
+        elif [ "$final_console" = "Включен" ]; then
+            label_console="[ИСПРАВЛЕНО]"
+        fi
+        echo -e "${label_console} Блокировка переключения TTY-консолей: ${final_console}" >> "$report_file"
+        if [ "$label_console" = "[  !!  ]" ]; then
             echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-console-lock enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Режимы блокировки» -> «Блокировка переключения TTY-консолей»" >> "$report_file"
+        elif [ "$label_console" = "[  !!  ] (Утилита не установлена)" ]; then
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Установите пакет astra-console-lock с помощью APT." >> "$report_file"
         fi
     fi
     
     # 10. Блокировка ptrace
     if [ "$req_ptrace" = "Включен" ]; then
-        local cur_ptrace
-        cur_ptrace=$(get_astra_control_status "astra-ptrace-lock")
-        if [ "$cur_ptrace" = "Включен" ]; then
-            echo -e "[  OK  ] Блокировка трассировки процессов (ptrace): Включено" >> "$report_file"
-        else
-            echo -e "[  !!  ] Блокировка трассировки процессов (ptrace): Выключено (требуется Включено)" >> "$report_file"
+        local label_ptrace="[  !!  ]"
+        if [ "$status_ptrace" = true ]; then
+            label_ptrace="[  OK  ]"
+        elif [ "$fix_ptrace" = "no_util" ]; then
+            label_ptrace="[  !!  ] (Утилита не установлена)"
+        elif [ "$final_ptrace" = "Включен" ]; then
+            label_ptrace="[ИСПРАВЛЕНО]"
+        fi
+        echo -e "${label_ptrace} Блокировка трассировки процессов (ptrace): ${final_ptrace}" >> "$report_file"
+        if [ "$label_ptrace" = "[  !!  ]" ]; then
             echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-ptrace-lock enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Режимы блокировки» -> «Блокировка трассировки процессов (ptrace)»" >> "$report_file"
+        elif [ "$label_ptrace" = "[  !!  ] (Утилита не установлена)" ]; then
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Установите пакет astra-ptrace-lock с помощью APT." >> "$report_file"
         fi
     fi
     
     # 11. Блокировка интерпретаторов
     if [ "$req_interpreters" = "Включен" ]; then
-        local cur_interpreters
-        cur_interpreters=$(get_astra_control_status "astra-interpreters-lock")
-        if [ "$cur_interpreters" = "Включен" ]; then
-            echo -e "[  OK  ] Ограничение консольных интерпретаторов: Включено" >> "$report_file"
-        else
-            echo -e "[  !!  ] Ограничение консольных интерпретаторов: Выключено (требуется Включено)" >> "$report_file"
+        local label_interpreters="[  !!  ]"
+        if [ "$status_interpreters" = true ]; then
+            label_interpreters="[  OK  ]"
+        elif [ "$fix_interpreters" = "no_util" ]; then
+            label_interpreters="[  !!  ] (Утилита не установлена)"
+        elif [ "$final_interpreters" = "Включен" ]; then
+            label_interpreters="[ИСПРАВЛЕНО]"
+        fi
+        echo -e "${label_interpreters} Ограничение консольных интерпретаторов: ${final_interpreters}" >> "$report_file"
+        if [ "$label_interpreters" = "[  !!  ]" ]; then
             echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните команду 'sudo astra-interpreters-lock enable'\n            или в GUI: «Локальная политика безопасности» -> «Безопасность» -> «Режимы блокировки» -> «Ограничение консольных интерпретаторов»" >> "$report_file"
+        elif [ "$label_interpreters" = "[  !!  ] (Утилита не установлена)" ]; then
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Установите пакет astra-interpreters-lock с помощью APT." >> "$report_file"
         fi
     fi
     
     # 12. Служба аудита auditd
     if [ "$req_audit" != "optional" ]; then
-        local audit_active=false
-        systemctl is-active auditd &>/dev/null && audit_active=true
-        if [ "$audit_active" = true ]; then
-            echo -e "[  OK  ] Служба аудита безопасности auditd: Активна" >> "$report_file"
-            if [ "$target_class" = "1А" ]; then
-                local rule_file="/etc/audit/rules.d/audit.rules"
-                if [ -f "$rule_file" ] && grep -q "time-change" "$rule_file" && grep -q "identity" "$rule_file"; then
-                    echo -e "[  OK  ] Расширенные правила аудита для класса 1А: Соответствуют" >> "$report_file"
-                else
-                    echo -e "[  !!  ] Расширенные правила аудита для класса 1А: Не настроены" >> "$report_file"
-                    echo -e "         -> РЕКОМЕНДАЦИЯ: Настройте правила аудита для времени, ФС и учетных записей в $rule_file" >> "$report_file"
+        local label_audit="[  !!  ]"
+        if [ "$status_audit" = true ]; then
+            label_audit="[  OK  ]"
+        elif [ "$final_audit" = "Включен" ]; then
+            label_audit="[ИСПРАВЛЕНО]"
+        fi
+        echo -e "${label_audit} Служба аудита безопасности auditd: ${final_audit}" >> "$report_file"
+        if [ "$label_audit" = "[  !!  ]" ]; then
+            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните: 'sudo systemctl enable --now auditd'\n            или в GUI: «Панель управления» -> «Аудит событий»" >> "$report_file"
+        fi
+        
+        if [ "$target_class" = "1А" ]; then
+            local label_rules="[  !!  ]"
+            if [ "$audit_rules_ok" = true ]; then
+                label_rules="[  OK  ]"
+            elif [ "$final_audit" = "Включен" ]; then
+                local check_rules_file="/etc/audit/rules.d/audit.rules"
+                if [ -f "$check_rules_file" ] && grep -q "time-change" "$check_rules_file" && grep -q "identity" "$check_rules_file"; then
+                    label_rules="[ИСПРАВЛЕНО]"
                 fi
             fi
-        else
-            echo -e "[  !!  ] Служба аудита безопасности auditd: Выключена (требуется Включена)" >> "$report_file"
-            echo -e "         -> РЕКОМЕНДАЦИЯ: Выполните: 'sudo systemctl enable --now auditd'\n            или в GUI: «Панель управления» -> «Аудит событий»" >> "$report_file"
+            echo -e "${label_rules} Расширенные правила аудита для класса 1А: $([ "$label_rules" = "[  OK  ]" -o "$label_rules" = "[ИСПРАВЛЕНО]" ] && echo "Соответствуют" || echo "Не настроены")" >> "$report_file"
+            if [ "$label_rules" = "[  !!  ]" ]; then
+                echo -e "         -> РЕКОМЕНДАЦИЯ: Настройте правила аудита для времени, ФС и учетных записей в /etc/audit/rules.d/audit.rules" >> "$report_file"
+            fi
         fi
     fi
     
@@ -1695,7 +2156,14 @@ check_class_compliance() {
         chown "$SUDO_UID:$SUDO_GID" "$report_file" 2>/dev/null
     fi
     
-    whiptail --title "Отчет сохранен" --msgbox "Отчет соответствия требованиям РД АС успешно сохранен в:\n$report_file" 10 76
+    local summary_msg="Отчет соответствия требованиям РД АС сохранен в:\n$report_file\n\n"
+    if [ ${#selected_fixes[@]} -gt 0 ]; then
+        summary_msg+="Применены автоматические исправления для выбранных параметров.\nПерепроверка завершена."
+    else
+        summary_msg+="Автоматические исправления не вносились."
+    fi
+    
+    whiptail --title "Комплаенс-контроль завершен" --msgbox "$summary_msg" 14 76
 }
 
 # ------------------------------------------------------------
